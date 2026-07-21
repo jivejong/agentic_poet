@@ -65,35 +65,36 @@ def clean_json(text: str) -> str:
 
 def call_groq(prompt: str, max_tokens: int = 1024) -> dict:
     """
-    Single Groq call against a Qwen3 reasoning model, returning a parsed dict.
+    Single Groq call against a Qwen3 model, returning a parsed dict.
 
-    We deliberately do NOT use Groq's strict `response_format=json_object` mode:
-    on reasoning models the grammar-constrained decoder fights the reasoning
-    pass and Groq rejects the generation with `json_validate_failed`
-    ("Failed to validate JSON"). Instead we:
-      • ask Groq to keep the chain-of-thought out of the message content
-        (reasoning_format="hidden"),
-      • instruct the model (in the prompt) to answer with JSON only,
-      • strip any stray <think> block, extract the {...} object, and parse it
-        ourselves — raising a clear error if parsing fails.
+    Qwen3 is a reasoning model, but these agents (compose a short poem, pick a
+    mood, yes/no relevance) don't need extended thinking — and by default the
+    hidden chain-of-thought eats the entire token budget, so `content` comes
+    back EMPTY (truncated at finish_reason="length") and JSON parsing fails.
 
-    Note: reasoning tokens count against the budget even when hidden, so
-    budgets are larger here than they were for Llama.
+    So we disable thinking with `reasoning_effort="none"`: Qwen3 answers
+    directly, which is faster, cheaper, and leaves the full budget for the
+    answer. We also skip Groq's strict `response_format=json_object` mode
+    (it triggers `json_validate_failed` on reasoning models) and instead
+    instruct the model to return JSON only, then parse defensively.
     """
     response = groq_client.chat.completions.create(
         model=GROQ_MODEL,
         messages=[{"role": "user", "content": prompt}],
-        reasoning_format="hidden",   # keep CoT out of message.content
+        reasoning_effort="none",     # skip chain-of-thought for these simple tasks
         max_completion_tokens=max_tokens,
         temperature=0.6,
     )
-    content = response.choices[0].message.content or ""
+    choice  = response.choices[0]
+    content = choice.message.content or ""
     candidate = clean_json(strip_reasoning(content))
     try:
         return json.loads(candidate)
     except json.JSONDecodeError as e:
+        reason = getattr(choice, "finish_reason", "unknown")
         raise ValueError(
-            f"Model did not return valid JSON ({e}). Raw output: {content[:300]!r}"
+            f"Model did not return valid JSON ({e}). "
+            f"finish_reason={reason}. Raw output: {content[:300]!r}"
         ) from e
 
 
