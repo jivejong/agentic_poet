@@ -63,30 +63,38 @@ def clean_json(text: str) -> str:
     return match.group(0) if match else text.strip()
 
 
-def call_groq(prompt: str, max_tokens: int = 1024) -> str:
+def call_groq(prompt: str, max_tokens: int = 1024) -> dict:
     """
-    Single Groq call against a Qwen3 reasoning model.
+    Single Groq call against a Qwen3 reasoning model, returning a parsed dict.
 
-    Qwen3 thinks before answering, so we:
+    We deliberately do NOT use Groq's strict `response_format=json_object` mode:
+    on reasoning models the grammar-constrained decoder fights the reasoning
+    pass and Groq rejects the generation with `json_validate_failed`
+    ("Failed to validate JSON"). Instead we:
       • ask Groq to keep the chain-of-thought out of the message content
-        (reasoning_format="hidden") — this leaves `content` as clean JSON,
-      • enforce JSON mode on the final answer,
-      • defensively strip any stray <think> block and re-extract the JSON
-        object in case reasoning leaks through.
+        (reasoning_format="hidden"),
+      • instruct the model (in the prompt) to answer with JSON only,
+      • strip any stray <think> block, extract the {...} object, and parse it
+        ourselves — raising a clear error if parsing fails.
 
-    Note: reasoning tokens count against the token budget even when hidden,
-    so budgets are larger here than they were for Llama.
+    Note: reasoning tokens count against the budget even when hidden, so
+    budgets are larger here than they were for Llama.
     """
     response = groq_client.chat.completions.create(
         model=GROQ_MODEL,
         messages=[{"role": "user", "content": prompt}],
-        response_format={"type": "json_object"},
-        reasoning_format="hidden",   # separate CoT from the JSON answer
+        reasoning_format="hidden",   # keep CoT out of message.content
         max_completion_tokens=max_tokens,
         temperature=0.6,
     )
     content = response.choices[0].message.content or ""
-    return clean_json(strip_reasoning(content))
+    candidate = clean_json(strip_reasoning(content))
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"Model did not return valid JSON ({e}). Raw output: {content[:300]!r}"
+        ) from e
 
 
 def keyword_precheck(entities: list, poem: str) -> bool:
@@ -154,7 +162,7 @@ def agent_bard(description: str, setting: str, entities: list) -> str:
     Return ONLY a JSON object:
     {{"poem": "line one / line two / line three / line four"}}
     """
-    data = json.loads(call_groq(prompt, max_tokens=1024))
+    data = call_groq(prompt, max_tokens=1024)
     return data["poem"]
 
 
@@ -187,7 +195,7 @@ def agent_moderator(entities: list, poem: str, description: str) -> dict:
     Return ONLY a JSON object:
     {{"verified": true_or_false, "reason": "one sentence explanation"}}
     """
-    return json.loads(call_groq(prompt, max_tokens=1024))
+    return call_groq(prompt, max_tokens=1024)
 
 
 def agent_sentiment(poem: str, description: str) -> tuple:
@@ -208,7 +216,7 @@ def agent_sentiment(poem: str, description: str) -> tuple:
     Return ONLY a JSON object:
     {{"mood": "ONE_MOOD", "reason": "one sentence justification"}}
     """
-    data = json.loads(call_groq(prompt, max_tokens=512))
+    data = call_groq(prompt, max_tokens=512)
     return data["mood"].upper(), data.get("reason", "")
 
 
