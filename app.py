@@ -42,7 +42,7 @@ if "GROQ_API_KEY" not in st.secrets:
 gemini_client = genai.Client(api_key=gemini_key)
 groq_client   = Groq(api_key=st.secrets["GROQ_API_KEY"].strip())
 
-GROQ_MODEL   = "llama-3.3-70b-versatile"
+GROQ_MODEL   = "qwen/qwen3.6-27b"        # Qwen3 reasoning model (Llama retired on Groq)
 GEMINI_MODEL = "gemini-2.5-flash"        # only used for vision
 
 # ── 3. SESSION STATE ──────────────────────────────────────────────────────────
@@ -52,21 +52,41 @@ for key, default in [("camera_key", 0), ("final_output", None)]:
 
 # ── 4. UTILITIES ──────────────────────────────────────────────────────────────
 
+def strip_reasoning(text: str) -> str:
+    """Remove any <think>...</think> chain-of-thought a reasoning model may emit."""
+    return re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+
+
 def clean_json(text: str) -> str:
-    """Extract the first {...} block from a string (strips markdown fences)."""
+    """Extract the first {...} block from a string (strips markdown fences / reasoning)."""
     match = re.search(r'\{.*\}', text, re.DOTALL)
     return match.group(0) if match else text.strip()
 
 
-def call_groq(prompt: str, max_tokens: int = 400) -> str:
-    """Single Groq call with JSON mode enforced — no markdown stripping needed."""
+def call_groq(prompt: str, max_tokens: int = 1024) -> str:
+    """
+    Single Groq call against a Qwen3 reasoning model.
+
+    Qwen3 thinks before answering, so we:
+      • ask Groq to keep the chain-of-thought out of the message content
+        (reasoning_format="hidden") — this leaves `content` as clean JSON,
+      • enforce JSON mode on the final answer,
+      • defensively strip any stray <think> block and re-extract the JSON
+        object in case reasoning leaks through.
+
+    Note: reasoning tokens count against the token budget even when hidden,
+    so budgets are larger here than they were for Llama.
+    """
     response = groq_client.chat.completions.create(
         model=GROQ_MODEL,
         messages=[{"role": "user", "content": prompt}],
         response_format={"type": "json_object"},
-        max_tokens=max_tokens,
+        reasoning_format="hidden",   # separate CoT from the JSON answer
+        max_completion_tokens=max_tokens,
+        temperature=0.6,
     )
-    return response.choices[0].message.content
+    content = response.choices[0].message.content or ""
+    return clean_json(strip_reasoning(content))
 
 
 def keyword_precheck(entities: list, poem: str) -> bool:
@@ -134,7 +154,7 @@ def agent_bard(description: str, setting: str, entities: list) -> str:
     Return ONLY a JSON object:
     {{"poem": "line one / line two / line three / line four"}}
     """
-    data = json.loads(call_groq(prompt, max_tokens=200))
+    data = json.loads(call_groq(prompt, max_tokens=1024))
     return data["poem"]
 
 
@@ -167,7 +187,7 @@ def agent_moderator(entities: list, poem: str, description: str) -> dict:
     Return ONLY a JSON object:
     {{"verified": true_or_false, "reason": "one sentence explanation"}}
     """
-    return json.loads(call_groq(prompt, max_tokens=150))
+    return json.loads(call_groq(prompt, max_tokens=1024))
 
 
 def agent_sentiment(poem: str, description: str) -> tuple:
@@ -188,7 +208,7 @@ def agent_sentiment(poem: str, description: str) -> tuple:
     Return ONLY a JSON object:
     {{"mood": "ONE_MOOD", "reason": "one sentence justification"}}
     """
-    data = json.loads(call_groq(prompt, max_tokens=100))
+    data = json.loads(call_groq(prompt, max_tokens=512))
     return data["mood"].upper(), data.get("reason", "")
 
 
@@ -296,9 +316,9 @@ with st.sidebar:
     | Agent | Model | Role |
     |---|---|---|
     | 🔍 Visionary | Gemini Flash | Image → Scene data |
-    | ✍️ Bard | Groq Llama 3.3 | Scene → Poem |
-    | ⚖️ Moderator | Groq Llama 3.3 | Verify poem relevance |
-    | 🎭 Sentiment | Groq Llama 3.3 | Poem → Mood |
+    | ✍️ Bard | Groq Qwen3 | Scene → Poem |
+    | ⚖️ Moderator | Groq Qwen3 | Verify poem relevance |
+    | 🎭 Sentiment | Groq Qwen3 | Poem → Mood |
     | 🎙️ Narrator | gTTS (local) | Poem → Voice |
     | 🎵 Maestro | Local files | Mood → Music |
     """)
